@@ -131,6 +131,14 @@ int main(int argc, char **argv) {
       printf("ℹ️ No static library found for '%s'\n", pkg_name);
     }
 
+    // Remove library header
+    snprintf(path, sizeof(path), "include/%s.h", pkg_name);
+    if (remove(path) == 0) {
+      printf("🗑️ Removed header include/%s.a\n", pkg_name);
+    } else {
+      printf("ℹ️ No header found for '%s'\n", pkg_name);
+    }
+
     // Remove from excalibur.txt (handles both direct and override
     // declarations)
     remove_from_file("excalibur.txt", pkg_name);
@@ -161,22 +169,36 @@ static int remove_from_file(const char *filepath, const char *pkg_name) {
 
   char line[512];
   int removed = 0;
-  while (fgets(line, sizeof(line), f)) {
-    // Check if line contains the package name as a component or suffix
-    // e.g., matches "libmath@v1.0.0" or "github.com/org/libmath@v1.0.0"
-    if (strstr(line, pkg_name) != NULL) {
-      // Basic safety check to ensure it's the package identifier, not a
-      // substring collision
-      char check[256];
-      snprintf(check, sizeof(check), "/%s@", pkg_name);
-      char check_direct[256];
-      snprintf(check_direct, sizeof(check_direct), "%s@", pkg_name);
+  size_t pkg_len = strlen(pkg_name);
 
-      if (strstr(line, check) != NULL || strstr(line, check_direct) != NULL) {
-        removed = 1;
-        continue; // Skip writing this line
+  while (fgets(line, sizeof(line), f)) {
+    int should_remove = 0;
+    char *match = line;
+
+    // Search for the package name in the line
+    while ((match = strstr(match, pkg_name)) != NULL) {
+      // 1. Check what comes BEFORE the match (must be start of line or '/')
+      int valid_start = (match == line) || (*(match - 1) == '/');
+
+      // 2. Check what comes AFTER the match (must be '@', newline, or end of
+      // string)
+      char next_char = match[pkg_len];
+      int valid_end = (next_char == '@' || next_char == '\n' ||
+                       next_char == '\r' || next_char == '\0');
+
+      // If both boundaries are valid, this is our exact package
+      if (valid_start && valid_end) {
+        should_remove = 1;
+        break;
       }
+      match++; // Advance to check the rest of the line just in case
     }
+
+    if (should_remove) {
+      removed = 1;
+      continue; // Skip writing this line to the temp file
+    }
+
     fputs(line, temp);
   }
 
