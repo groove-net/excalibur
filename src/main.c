@@ -34,54 +34,96 @@ int main(int argc, char **argv) {
       manifest.override_count = 0;
     }
 
+    int added_new_pkg = 0; // Track if we actually append something new
+
     // If an ad-hoc URL/spec is provided on the CLI (e.g., excalibur install
     // <url>)
     if (argc >= 3) {
       const char *pkg_spec = argv[2];
 
-      // Check if it's already in the manifest in-memory
+      // 1. Temporarily parse the incoming spec to determine its URL and name
+      char temp_url[256];
+      strncpy(temp_url, pkg_spec, sizeof(temp_url) - 1);
+      temp_url[sizeof(temp_url) - 1] = '\0';
+
+      char *at_symbol = strchr(temp_url, '@');
+      if (at_symbol) {
+        *at_symbol = '\0'; // temp_url now contains just the URL
+      }
+
+      char proposed_name[256];
+      char *last_slash = strrchr(temp_url, '/');
+      if (last_slash) {
+        strncpy(proposed_name, last_slash + 1, sizeof(proposed_name) - 1);
+      } else {
+        strncpy(proposed_name, temp_url, sizeof(proposed_name) - 1);
+      }
+      proposed_name[sizeof(proposed_name) - 1] = '\0';
+
+      // 2. Check the manifest for exact matches or name conflicts
       int already_exists = 0;
+      int name_conflict = 0;
+      int conflict_index = -1;
+
       for (uint32_t i = 0; i < manifest.direct_count; i++) {
         char full_spec[512];
         snprintf(full_spec, sizeof(full_spec), "%s@%s",
                  manifest.direct_deps[i].raw_url.data,
                  manifest.direct_deps[i].version.data);
+
+        // Check if exact same URL/Spec is already requested
         if (strcmp(full_spec, pkg_spec) == 0 ||
             strcmp(manifest.direct_deps[i].raw_url.data, pkg_spec) == 0) {
           already_exists = 1;
           break;
         }
+
+        // Check if the name matches, but the URL is different (Conflict!)
+        if (strcmp(manifest.direct_deps[i].name.data, proposed_name) == 0 &&
+            strcmp(manifest.direct_deps[i].raw_url.data, temp_url) != 0) {
+          name_conflict = 1;
+          conflict_index = i;
+          break;
+        }
       }
 
-      if (!already_exists && manifest.direct_count < MAX_DEPS) {
+      if (name_conflict) {
+        fprintf(stderr, "\n❌ Error: Naming conflict detected.\n");
+        fprintf(stderr, "   Cannot install '%s'.\n", pkg_spec);
+        fprintf(stderr, "   The name '%s' is already in use by '%s'.\n",
+                proposed_name,
+                manifest.direct_deps[conflict_index].raw_url.data);
+        return EXIT_FAILURE;
+      }
+
+      // SHORT-CIRCUIT: If it already exists, just exit now so we don't rebuild
+      // everything
+      if (already_exists) {
+        printf("ℹ️ '%s' is already in excalibur.txt.\n", pkg_spec);
+        return EXIT_SUCCESS;
+      }
+
+      // 3. If no conflict and it doesn't already exist, add it
+      if (manifest.direct_count < MAX_DEPS) {
         Dependency *new_dep = &manifest.direct_deps[manifest.direct_count++];
         new_dep->raw_url = INIT_FSTR(FixedString256);
         new_dep->version = INIT_FSTR(FixedString64);
         new_dep->name = INIT_FSTR(FixedString64);
 
-        char *at_symbol = strchr(pkg_spec, '@');
-        if (at_symbol) {
-          *at_symbol = '\0';
+        char *spec_at = strchr(pkg_spec, '@');
+        if (spec_at) {
+          *spec_at = '\0';
           fstr_assign(&new_dep->raw_url, pkg_spec);
-          fstr_assign(&new_dep->version, at_symbol + 1);
-          *at_symbol = '@'; // Restore string just in case
+          fstr_assign(&new_dep->version, spec_at + 1);
+          *spec_at = '@'; // Restore string just in case
         } else {
           fstr_assign(&new_dep->raw_url, pkg_spec);
           fstr_assign(&new_dep->version, "");
         }
 
-        char *last_slash = strrchr(new_dep->raw_url.data, '/');
-        if (last_slash) {
-          fstr_assign(&new_dep->name, last_slash + 1);
-        } else {
-          fstr_assign(&new_dep->name, new_dep->raw_url.data);
-        }
+        fstr_assign(&new_dep->name, proposed_name);
+        added_new_pkg = 1;
       }
-    }
-
-    if (manifest.direct_count == 0 && manifest.override_count == 0) {
-      printf("No dependencies found in excalibur.txt or command line.\n");
-      return EXIT_SUCCESS;
     }
 
     const char *tmp_workdir = ".excal_tmp";
@@ -98,14 +140,17 @@ int main(int argc, char **argv) {
     }
 
     // Build succeeded! Now safely persist the ad-hoc package to excalibur.txt
-    // if provided
     if (argc >= 3) {
       const char *pkg_spec = argv[2];
-      FILE *f = fopen("excalibur.txt", "a");
-      if (f) {
-        fprintf(f, "%s\n", pkg_spec);
-        fclose(f);
-        printf("➕ Added '%s' to excalibur.txt\n", pkg_spec);
+      if (added_new_pkg) {
+        FILE *f = fopen("excalibur.txt", "a");
+        if (f) {
+          fprintf(f, "%s\n", pkg_spec);
+          fclose(f);
+          printf("➕ Added '%s' to excalibur.txt\n", pkg_spec);
+        }
+      } else {
+        printf("ℹ️ '%s' is already in excalibur.txt.\n", pkg_spec);
       }
     }
 
@@ -134,13 +179,12 @@ int main(int argc, char **argv) {
     // Remove library header
     snprintf(path, sizeof(path), "include/%s.h", pkg_name);
     if (remove(path) == 0) {
-      printf("🗑️ Removed header include/%s.a\n", pkg_name);
+      printf("🗑️ Removed header include/%s.h\n", pkg_name);
     } else {
       printf("ℹ️ No header found for '%s'\n", pkg_name);
     }
 
-    // Remove from excalibur.txt (handles both direct and override
-    // declarations)
+    // Remove from excalibur.txt (handles both direct and override declarations)
     remove_from_file("excalibur.txt", pkg_name);
 
     // Purge from excalibur.lock

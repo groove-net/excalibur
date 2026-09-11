@@ -10,6 +10,7 @@
 typedef struct {
   FixedString64 name;
   FixedString64 version;
+  FixedString256 raw_url;
   uint8_t commit_hash[41];
 } VisitedPackage;
 
@@ -76,6 +77,46 @@ int fetch_and_build_manifest(const Manifest *manifest, const char *work_dir) {
            "cp %s/*.h include/ 2>/dev/null || true", work_dir);
   system(batch_cmd);
 
+  // --- Auto-Pruning Step ---
+  // Ensure the local environment perfectly matches the resolved manifest
+  DIR *lib_dir = opendir("lib");
+  if (lib_dir) {
+    struct dirent *ent;
+    while ((ent = readdir(lib_dir)) != NULL) {
+      if (strstr(ent->d_name, ".a")) {
+        // Extract package name from "pkgname.a"
+        char active_pkg[256];
+        strncpy(active_pkg, ent->d_name, sizeof(active_pkg) - 1);
+        active_pkg[sizeof(active_pkg) - 1] = '\0';
+        char *ext = strstr(active_pkg, ".a");
+        if (ext)
+          *ext = '\0';
+
+        // Check if this package exists in our newly resolved dependency tree
+        int is_valid = 0;
+        for (int i = 0; i < visited_count; i++) {
+          if (strcmp(visited[i].name.data, active_pkg) == 0) {
+            is_valid = 1;
+            break;
+          }
+        }
+
+        // If it's not in the tree, it's an orphan. Nuke it.
+        if (!is_valid) {
+          printf("🧹 Pruning orphaned artifact: '%s'\n", active_pkg);
+
+          char rm_path[512];
+          snprintf(rm_path, sizeof(rm_path), "lib/%s.a", active_pkg);
+          remove(rm_path);
+
+          snprintf(rm_path, sizeof(rm_path), "include/%s.h", active_pkg);
+          remove(rm_path);
+        }
+      }
+    }
+    closedir(lib_dir);
+  }
+
   return 0;
 }
 
@@ -103,8 +144,25 @@ static int resolve_recursive(Dependency *dep, const char *work_dir,
   // 2. Check Visited Registry for Conflicts
   for (int i = 0; i < *visited_count; i++) {
     if (strcmp(visited[i].name.data, dep->name.data) == 0) {
+      // FATAL: The name is the same, but the URLs are different!
+      if (strcmp(visited[i].raw_url.data, dep->raw_url.data) != 0) {
+        fprintf(stderr, "\n❌ Fatal Naming Conflict Detected:\n");
+        fprintf(stderr,
+                "   The package name '%s' is being claimed by two different "
+                "repositories:\n",
+                dep->name.data);
+        fprintf(stderr, "   1. %s\n", visited[i].raw_url.data);
+        fprintf(stderr, "   2. %s\n", dep->raw_url.data);
+        fprintf(stderr,
+                "   Excalibur compiles artifacts to lib/%s.a and include/%s.h, "
+                "so names must be unique.\n",
+                dep->name.data, dep->name.data);
+        return -1;
+      }
+
+      // URLs and names match, check for version mismatch
       if (strcmp(visited[i].version.data, dep->version.data) == 0) {
-        return 0; // Already resolved with matching version
+        return 0; // Already resolved perfectly
       } else {
         fprintf(stderr, "\n❌ Unresolved Dependency Conflict for '%s':\n",
                 dep->name.data);
@@ -126,8 +184,13 @@ static int resolve_recursive(Dependency *dep, const char *work_dir,
     reg_index = *visited_count;
     visited[reg_index].name = INIT_FSTR(FixedString64);
     visited[reg_index].version = INIT_FSTR(FixedString64);
+    visited[reg_index].raw_url =
+        INIT_FSTR(FixedString256); // Initialize new field
+
     fstr_assign(&visited[reg_index].name, dep->name.data);
     fstr_assign(&visited[reg_index].version, dep->version.data);
+    fstr_assign(&visited[reg_index].raw_url, dep->raw_url.data); // Store URL
+
     memset(visited[reg_index].commit_hash, 0,
            sizeof(visited[reg_index].commit_hash));
     (*visited_count)++;
@@ -140,6 +203,22 @@ static int resolve_recursive(Dependency *dep, const char *work_dir,
       target_commit = (char *)locked_entries[i].commit_hash;
       break;
     }
+  }
+
+  // 3.5 Fast-Path: Artifact Check
+  char expected_lib[512], expected_inc[512];
+  snprintf(expected_lib, sizeof(expected_lib), "lib/%s.a", dep->name.data);
+  snprintf(expected_inc, sizeof(expected_inc), "include/%s.h", dep->name.data);
+
+  if (target_commit && access(expected_lib, F_OK) == 0 &&
+      access(expected_inc, F_OK) == 0) {
+    printf("⚡ %s is already up to date.\n", dep->name.data);
+
+    if (reg_index >= 0) {
+      strncpy((char *)visited[reg_index].commit_hash, target_commit,
+              sizeof(visited[reg_index].commit_hash) - 1);
+    }
+    return 0; // Short-circuit: skip Git fetch and compilation
   }
 
   // 4. Fetch via Git
@@ -182,7 +261,8 @@ static int resolve_recursive(Dependency *dep, const char *work_dir,
     return -1;
   }
 
-  // If locked, force checkout to the exact commit hash for absolute determinism
+  // If locked, force checkout to the exact commit hash for absolute
+  // determinism
   if (target_commit) {
     char *const checkout_args[] = {"git",      "-C",      dep_dir.data,
                                    "checkout", "--quiet", (char *)target_commit,
